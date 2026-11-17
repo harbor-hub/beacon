@@ -11,6 +11,7 @@ func NewRootCmd(use, version string, fn func(c *cobra.Command, args []string) er
 		SilenceUsage:          true,
 		SilenceErrors:         true,
 		DisableFlagsInUseLine: true,
+		Args:                  cobra.NoArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			return fn(c, args)
 		},

@@ -5,17 +5,22 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/miekg/dns"
 )
 
 type Beacon struct {
-	Version  string
-	Addr     string
-	Domains  []string
-	Upstream []string
-	Verbose  bool
+	Version      string
+	DNSAddr      string
+	DNSUpstream  []string
+	DNSDomains   []string
+	Networks     []string
+	RecordLabels string
+	APIAddr      string
+	APIToken     string
+	Verbose      bool
 }
 
 func New() *Beacon {
@@ -23,12 +28,29 @@ func New() *Beacon {
 }
 
 func (b *Beacon) Run() error {
-	fmt.Printf("\nBeacon %s\n\n  addr:     %s\n  domain:   %s\n  upstream: %s\n\n",
+	apiAddr := "(disabled)"
+	if b.APIAddr != "" {
+		apiAddr = b.APIAddr
+	}
+
+	recordLabels := "-"
+	if b.RecordLabels != "" {
+		recordLabels = b.RecordLabels
+	}
+
+	fmt.Printf("\nBeacon %s\n\n  dns-listen:    %s\n  dns-upstream:  %s\n  dns-domain:    %s\n  network:       %s\n  record-labels: %s\n  api-listen:    %s\n\n",
 		b.Version,
-		b.Addr,
-		strings.Join(b.Domains, ", "),
-		strings.Join(b.Upstream, ", "),
+		b.DNSAddr,
+		strings.Join(b.DNSUpstream, ", "),
+		strings.Join(b.DNSDomains, ", "),
+		strings.Join(b.Networks, ", "),
+		recordLabels,
+		apiAddr,
 	)
+
+	for _, w := range b.apiWarnings() {
+		log.Printf("[API] Warning: %s", w)
+	}
 
 	registry := NewRegistry()
 	registry.Verbose = b.Verbose
@@ -39,15 +61,19 @@ func (b *Beacon) Run() error {
 	}
 	defer cli.Close()
 
-	loadRunning(cli, registry)
-	go watchEvents(cli, registry)
+	// Docker may emit the start event of Beacon's own container after Beacon
+	// is already running, before the subscription below exists. Replaying a
+	// few seconds of events covers that; handling an event twice is harmless.
+	since := time.Now().Add(-5 * time.Second)
+	loadRunning(cli, registry, b.Networks)
+	go watchEvents(cli, registry, b.Networks, since)
 
-	for _, domain := range b.Domains {
+	for _, domain := range b.DNSDomains {
 		dns.HandleFunc(domain+".", makeDomainHandler(registry, b.Verbose))
 	}
 
 	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		resp, err := forward(r, b.Upstream)
+		resp, err := forward(r, b.DNSUpstream)
 		if err != nil {
 			log.Printf("[DNS] Forward error: %v", err)
 			dns.HandleFailed(w, r)
@@ -57,12 +83,21 @@ func (b *Beacon) Run() error {
 		w.WriteMsg(resp)
 	})
 
-	server := &dns.Server{Addr: b.Addr, Net: "udp"}
-	if err := server.ListenAndServe(); err != nil {
-		return fmt.Errorf("DNS server error: %w", err)
+	errCh := make(chan error, 2)
+
+	if b.APIAddr != "" {
+		server := newHTTPServer(b.APIAddr, b.httpHandler(registry))
+		go func() {
+			errCh <- fmt.Errorf("HTTP server error: %w", server.ListenAndServe())
+		}()
 	}
 
-	return nil
+	go func() {
+		server := &dns.Server{Addr: b.DNSAddr, Net: "udp"}
+		errCh <- fmt.Errorf("DNS server error: %w", server.ListenAndServe())
+	}()
+
+	return <-errCh
 }
 
 func makeDomainHandler(registry *Registry, verbose bool) dns.HandlerFunc {

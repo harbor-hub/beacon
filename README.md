@@ -20,7 +20,7 @@ No port conflicts. No proxy. Direct connection to container IP.
 
 #### 1. Start Beacon
 
-> Port 53 is occupied by `systemd-resolved` on most modern Linux systems. Beacon uses port `5053` by default to avoid the conflict.
+> Port 53 is occupied by `systemd-resolved` on most modern Linux systems, so the container's DNS port is mapped to host port `5053`.
 
 ```bash
 docker run -d \
@@ -28,18 +28,18 @@ docker run -d \
   --restart unless-stopped \
   --log-opt max-size=1m \
   --log-opt max-file=3 \
-  -p 5053:53/udp \
+  -p 127.0.0.1:5053:53/udp \
   -v /var/run/docker.sock:/var/run/docker.sock \
   ghcr.io/harbor-hub/beacon:latest \
-    --addr 0.0.0.0:53 \
-    --domain beacon,lh \
+    --dns-listen :53 \
+    --dns-domain beacon,lh \
     --verbose
 ```
 
 When running outside Docker, set upstream DNS explicitly to avoid a forwarding loop with `systemd-resolved`:
 
 ```bash
-beacon --addr 0.0.0.0:5053 --upstream 8.8.8.8
+beacon --dns-listen 127.0.0.1:5053 --dns-upstream 8.8.8.8
 ```
 
 #### 2. Configure DNS (Ubuntu)
@@ -55,7 +55,7 @@ DNS=127.0.0.1:5053
 Domains=~beacon ~lh
 ```
 
-Add one `~<tld>` entry per domain configured in `BEACON_DOMAIN`.
+Add one `~<tld>` entry per domain configured in `--dns-domain`.
 
 Replace `<docker-bridge-gateway>` with the IP of your Docker bridge gateway:
 
@@ -74,7 +74,7 @@ sudo systemctl restart systemd-resolved
 
 #### 1. Start Beacon
 
-On macOS, port 53 is typically free, so Docker can bind directly:
+> Port 53 can be occupied on macOS, so the container's DNS port is mapped to host port `5053`.
 
 ```bash
 docker run -d \
@@ -82,27 +82,47 @@ docker run -d \
   --restart unless-stopped \
   --log-opt max-size=1m \
   --log-opt max-file=3 \
-  -p 53:53/udp \
+  -p 127.0.0.1:5053:53/udp \
   -v /var/run/docker.sock:/var/run/docker.sock \
   ghcr.io/harbor-hub/beacon:latest \
-    --addr 0.0.0.0:53 \
-    --domain beacon,lh \
+    --dns-listen :53 \
+    --dns-domain beacon,lh \
     --verbose
 ```
 
 #### 2. Configure DNS
 
-Create a resolver file for each domain configured in `BEACON_DOMAIN`:
+Create a resolver file for each domain configured in `--dns-domain`:
 
 ```bash
 sudo mkdir -p /etc/resolver
 sudo tee /etc/resolver/beacon <<EOF
 nameserver 127.0.0.1
+port 5053
 EOF
 sudo tee /etc/resolver/lh <<EOF
 nameserver 127.0.0.1
+port 5053
 EOF
 ```
+
+#### 3. Verify
+
+`dig` and `nslookup` bypass `/etc/resolver`, so they won't use these files. Test with the system resolver instead:
+
+```bash
+dscacheutil -q host -a name my-app.beacon
+```
+
+Or query Beacon directly:
+
+```bash
+dig @127.0.0.1 -p 5053 my-app.beacon
+```
+
+#### Container IP routing
+
+Docker Desktop runs containers inside a virtual machine, so container IPs (e.g. `172.17.0.2`) are not reachable from the macOS host by default. Names will resolve, but connections will fail. To route traffic to container IPs, use a tool such as [docker-mac-net-connect](https://github.com/chipmk/docker-mac-net-connect), or a Docker runtime that supports it out of the box, such as [OrbStack](https://orbstack.dev).
 
 ## Usage
 
@@ -172,13 +192,50 @@ labels:
   - "beacon.host=my-app.beacon,{foo,bar,baz}.lh,node{1..4}.lh"
 ```
 
+### Multiple networks
+
+A container on several networks has several IPs. Beacon answers with its IP on the first network in `--network` (default `bridge`) the container is on; if none, with its IP on the first network by name.
+
+Add a shared network when containers not on `bridge` (e.g. Compose services) must be reachable by another container:
+
+```bash
+docker network create shared
+docker network connect shared beacon   # then recreate Beacon with --network bridge,shared
+```
+
+Attach those containers to `shared`; containers on `bridge` keep their `bridge` IP. A container that must reach all of these IPs needs both networks. On `shared`, other containers reach Beacon's API by name, e.g. with `--api-listen :80`: `http://beacon/api/records`.
+
+Beacon reads the IP when a container starts: after changing its networks, restart the container.
+
+### Records API
+
+With `--api-listen`, Beacon serves its records over HTTP, so other tools can use them:
+
+```bash
+curl http://127.0.0.1:8080/api/records
+```
+
+```json
+{"records": [
+  {"host": "my-app.beacon", "target": "172.17.0.2", "container": "my-app", "labels": {"proxy.port": "3000"}}
+]}
+```
+
+Labels are included only when their key starts with the `--record-labels` prefix (e.g. `proxy.`). With `--api-token`, requests to `/api/*` must send `Authorization: Bearer <token>`.
+
+> The API exposes your container map. Do not publish the API port on all interfaces: in Docker, use `--api-listen :8080` without `-p`, or `-p 127.0.0.1:8080:8080`.
+
 ## Configuration
 
 All options can be set via flags or environment variables.
 
 | Flag | Variable | Default | Description |
 |---|---|---|---|
-| `--addr` | `BEACON_ADDR` | `0.0.0.0:5053` | DNS listen address |
-| `--domain` | `BEACON_DOMAIN` | `beacon` | DNS zones to intercept (comma-separated) |
-| `--upstream` | `BEACON_UPSTREAM` | auto | Upstream DNS servers (comma-separated). When unset, read from `/etc/resolv.conf`; falls back to `8.8.8.8, 8.8.4.4` if unavailable. |
+| `--dns-listen` | `BEACON_DNS_LISTEN` | `:5053` | DNS listen address |
+| `--dns-upstream` | `BEACON_DNS_UPSTREAM` | auto | Upstream DNS servers (comma-separated). When unset, read from `/etc/resolv.conf`; falls back to `8.8.8.8, 8.8.4.4` if unavailable. |
+| `--dns-domain` | `BEACON_DNS_DOMAIN` | `beacon` | DNS zones to intercept (comma-separated) |
+| `--network` | `BEACON_NETWORK` | `bridge` | Docker networks in order of preference (comma-separated) whose container IP is used; otherwise the first network by name |
+| `--record-labels` | `BEACON_RECORD_LABELS` | | Include container labels with this prefix in records (empty = none) |
+| `--api-listen` | `BEACON_API_LISTEN` | | API listen address, HTTP (empty = disabled) |
+| `--api-token` | `BEACON_API_TOKEN` | | Bearer token required for `/api/*` (empty = no auth) |
 | `--verbose` | `BEACON_VERBOSE` | `false` | Log DNS queries |

@@ -10,24 +10,36 @@ func NewCmd(name, version string) *cobra.Command {
 	beacon := New()
 
 	rootCmd := NewRootCmd(name, version, func(c *cobra.Command, args []string) error {
-		addr, _ := c.Flags().GetString("addr")
-		domainsStr, _ := c.Flags().GetString("domain")
-		upstreamStr, _ := c.Flags().GetString("upstream")
+		dnsAddr, _ := c.Flags().GetString("dns-listen")
+		dnsUpstream, _ := c.Flags().GetString("dns-upstream")
+		dnsDomains, _ := c.Flags().GetString("dns-domain")
+		networks, _ := c.Flags().GetString("network")
+		recordLabels, _ := c.Flags().GetString("record-labels")
+		apiAddr, _ := c.Flags().GetString("api-listen")
+		apiToken, _ := c.Flags().GetString("api-token")
 		verbose, _ := c.Flags().GetBool("verbose")
 
 		beacon.Version = version
-		beacon.Addr = addr
-		beacon.Domains = splitTrimmed(domainsStr)
-		beacon.Upstream = ResolveUpstream(splitTrimmed(upstreamStr))
+		beacon.DNSAddr = dnsAddr
+		beacon.DNSUpstream = ResolveUpstream(splitTrimmed(dnsUpstream))
+		beacon.DNSDomains = splitTrimmed(dnsDomains)
+		beacon.Networks = splitTrimmed(networks)
+		beacon.RecordLabels = recordLabels
+		beacon.APIAddr = apiAddr
+		beacon.APIToken = apiToken
 		beacon.Verbose = verbose
 
 		return beacon.Run()
 	})
 
 	rootCmd.Flags().SortFlags = false
-	rootCmd.Flags().String("addr", LookupEnv("BEACON_ADDR", "0.0.0.0:5053").GetString(), "DNS listen address")
-	rootCmd.Flags().String("domain", LookupEnv("BEACON_DOMAIN", "beacon").GetString(), "Comma-separated local domains")
-	rootCmd.Flags().String("upstream", LookupEnv("BEACON_UPSTREAM", "").GetString(), "Comma-separated upstream DNS servers")
+	rootCmd.Flags().String("dns-listen", LookupEnv("BEACON_DNS_LISTEN", ":5053").GetString(), "DNS listen address")
+	rootCmd.Flags().String("dns-upstream", LookupEnv("BEACON_DNS_UPSTREAM", "").GetString(), "Comma-separated upstream DNS servers")
+	rootCmd.Flags().String("dns-domain", LookupEnv("BEACON_DNS_DOMAIN", "beacon").GetString(), "Comma-separated local domains")
+	rootCmd.Flags().String("network", LookupEnv("BEACON_NETWORK", "bridge").GetString(), "Comma-separated Docker networks, in order of preference, whose container IP is used (fallback: first network by name)")
+	rootCmd.Flags().String("record-labels", LookupEnv("BEACON_RECORD_LABELS", "").GetString(), "Include container labels with this prefix in records (empty = none)")
+	rootCmd.Flags().String("api-listen", LookupEnv("BEACON_API_LISTEN", "").GetString(), "API listen address, HTTP (empty = disabled)")
+	rootCmd.Flags().String("api-token", LookupEnv("BEACON_API_TOKEN", "").GetString(), "Bearer token required for /api/* (empty = no auth)")
 	rootCmd.Flags().BoolP("verbose", "v", LookupEnv("BEACON_VERBOSE", false).GetBool(), "Enable verbose logging")
 
 	ApplyDefaultFlags(rootCmd)

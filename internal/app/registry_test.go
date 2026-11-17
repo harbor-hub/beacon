@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -473,4 +474,68 @@ func TestRegistry_RaceDetector(t *testing.T) {
 		_, _ = r.Get(fmt.Sprintf("stress%d.local", i%20))
 	}
 	<-done
+}
+
+// ---------------------------------------------------------------------------
+// SetRecord / List
+// ---------------------------------------------------------------------------
+
+func TestSetRecord_StoresAllFields(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	r.SetRecord(Record{
+		Host:      "Web.Local.",
+		Target:    "10.0.0.1",
+		Container: "web",
+		Labels:    map[string]string{"proxy.port": "3000"},
+	})
+
+	if ip, ok := r.Get("web.local"); !ok || ip != "10.0.0.1" {
+		t.Fatalf("Get = %q, %v", ip, ok)
+	}
+
+	list := r.List()
+	if len(list) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(list))
+	}
+	want := Record{Host: "web.local", Target: "10.0.0.1", Container: "web", Labels: map[string]string{"proxy.port": "3000"}}
+	if !reflect.DeepEqual(list[0], want) {
+		t.Errorf("record = %+v, want %+v (host lowercase, no trailing dot)", list[0], want)
+	}
+}
+
+func TestList_SortedByHost(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	r.Set("c.local", "10.0.0.3")
+	r.Set("a.local", "10.0.0.1")
+	r.Set("b.local", "10.0.0.2")
+
+	var hosts []string
+	for _, rec := range r.List() {
+		hosts = append(hosts, rec.Host)
+	}
+	if !reflect.DeepEqual(hosts, []string{"a.local", "b.local", "c.local"}) {
+		t.Errorf("hosts = %v", hosts)
+	}
+}
+
+func TestList_Empty(t *testing.T) {
+	t.Parallel()
+	if list := NewRegistry().List(); len(list) != 0 {
+		t.Errorf("expected empty list, got %v", list)
+	}
+}
+
+func TestList_AfterDelete(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	r.Set("a.local", "10.0.0.1")
+	r.Set("b.local", "10.0.0.2")
+	r.Delete("a.local")
+
+	list := r.List()
+	if len(list) != 1 || list[0].Host != "b.local" {
+		t.Errorf("list = %+v", list)
+	}
 }

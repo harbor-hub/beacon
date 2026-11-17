@@ -67,7 +67,7 @@ func forward(r *dns.Msg, servers []string) (*dns.Msg, error) {
 		name = r.Question[0].Name
 	}
 
-	if (LookupEnv("BEACON_DEBUG", false).GetBool()) {
+	if LookupEnv("BEACON_DEBUG", false).GetBool() {
 		log.Printf("[DEBUG] Forward: %s", name)
 	}
 
