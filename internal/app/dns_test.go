@@ -3,9 +3,12 @@ package app
 import (
 	"fmt"
 	"net"
-	"strings"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -58,196 +61,199 @@ func query(t *testing.T, addr, name string, qtype uint16) *dns.Msg {
 }
 
 // ---------------------------------------------------------------------------
-// ResolveUpstream – table-driven
+// Listeners and upstream
 // ---------------------------------------------------------------------------
+
+func TestParseDNSListeners(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseDNSListeners([]string{":5053, :53?upstream=auto", "", "127.0.0.1:54?upstream=1.1.1.1&upstream=[::1]:5353"})
+	want := []DNSListener{
+		{Addr: ":5053"},
+		{Addr: ":53", Upstream: []string{autoUpstream}},
+		{Addr: "127.0.0.1:54", Upstream: []string{"1.1.1.1", "[::1]:5353"}},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, %v; want %+v", got, err, want)
+	}
+
+	for _, in := range []string{
+		"?upstream=auto",   // no address
+		":53?stub=self",    // unknown option
+		":53?upstream=%zz", // bad escape
+	} {
+		if _, err := parseDNSListeners([]string{in}); err == nil {
+			t.Errorf("%q: expected error", in)
+		}
+	}
+}
+
+func TestValidateDNSListeners(t *testing.T) {
+	t.Parallel()
+
+	valid := [][]DNSListener{
+		{{Addr: ":53"}},
+		{{Addr: ":5053"}, {Addr: ":53", Upstream: []string{autoUpstream}}},
+		{{Addr: ":53", Upstream: []string{"1.1.1.1", "8.8.8.8:53", "::1", "[::1]:5353"}}},
+	}
+	for _, l := range valid {
+		if err := validateDNSListeners(l); err != nil {
+			t.Errorf("%+v: %v", l, err)
+		}
+	}
+
+	invalid := map[string][]DNSListener{
+		"none":              nil,
+		"duplicate":         {{Addr: ":53"}, {Addr: ":53", Upstream: []string{autoUpstream}}},
+		"auto with servers": {{Addr: ":53", Upstream: []string{autoUpstream, "1.1.1.1"}}},
+		"hostname":          {{Addr: ":53", Upstream: []string{"dns.google"}}},
+	}
+	for name, l := range invalid {
+		if err := validateDNSListeners(l); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+}
 
 func TestResolveUpstream(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		input   []string
-		wantLen int                              // minimum result length expected (0 = any)
-		wantAll []string                         // every element must appear somewhere in result
-		check   func(t *testing.T, got []string) // optional extra assertions
-	}{
-		{
-			name:  "already_has_port",
-			input: []string{"1.2.3.4:53"},
-			check: func(t *testing.T, got []string) {
-				if len(got) != 1 || got[0] != "1.2.3.4:53" {
-					t.Errorf("unexpected result: %v", got)
-				}
-			},
-		},
-		{
-			name:  "no_port_gets_53_appended",
-			input: []string{"1.2.3.4"},
-			check: func(t *testing.T, got []string) {
-				if len(got) != 1 || got[0] != "1.2.3.4:53" {
-					t.Errorf("expected [1.2.3.4:53], got %v", got)
-				}
-			},
-		},
-		{
-			name:  "mixed_ports",
-			input: []string{"1.1.1.1", "8.8.8.8:5353"},
-			check: func(t *testing.T, got []string) {
-				if len(got) != 2 {
-					t.Fatalf("expected 2 servers, got %d: %v", len(got), got)
-				}
-				if got[0] != "1.1.1.1:53" {
-					t.Errorf("got[0] = %q; want 1.1.1.1:53", got[0])
-				}
-				if got[1] != "8.8.8.8:5353" {
-					t.Errorf("got[1] = %q; want 8.8.8.8:5353", got[1])
-				}
-			},
-		},
-		{
-			name:  "custom_non_standard_port",
-			input: []string{"9.9.9.9:5300"},
-			check: func(t *testing.T, got []string) {
-				if len(got) != 1 || got[0] != "9.9.9.9:5300" {
-					t.Errorf("expected [9.9.9.9:5300], got %v", got)
-				}
-			},
-		},
-		{
-			name:  "multiple_no_port",
-			input: []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"},
-			check: func(t *testing.T, got []string) {
-				want := []string{"10.0.0.1:53", "10.0.0.2:53", "10.0.0.3:53"}
-				if len(got) != len(want) {
-					t.Fatalf("expected %v, got %v", want, got)
-				}
-				for i := range want {
-					if got[i] != want[i] {
-						t.Errorf("got[%d] = %q; want %q", i, got[i], want[i])
-					}
-				}
-			},
-		},
-		{
-			name:  "empty_falls_back_to_resolv_conf_or_google",
-			input: []string{},
-			check: func(t *testing.T, got []string) {
-				if len(got) == 0 {
-					t.Error("expected at least one fallback server")
-				}
-				for _, s := range got {
-					if !strings.Contains(s, ":") {
-						t.Errorf("fallback server %q missing port", s)
-					}
-				}
-			},
-		},
-		{
-			name:  "nil_falls_back_to_resolv_conf_or_google",
-			input: nil,
-			check: func(t *testing.T, got []string) {
-				if len(got) == 0 {
-					t.Error("expected at least one fallback server for nil input")
-				}
-				for _, s := range got {
-					if !strings.Contains(s, ":") {
-						t.Errorf("fallback server %q missing port", s)
-					}
-				}
-			},
-		},
-		{
-			name:  "ipv6_with_port",
-			input: []string{"[::1]:53"},
-			check: func(t *testing.T, got []string) {
-				// Already has a colon (two, in fact) – must not be modified
-				if len(got) != 1 {
-					t.Fatalf("expected 1 server, got %d", len(got))
-				}
-				// The existing colon detection means "[::1]:53" already contains ":"
-				// so it must pass through unchanged.
-				if got[0] != "[::1]:53" {
-					t.Errorf("got[0] = %q; want [::1]:53", got[0])
-				}
-			},
-		},
-		{
-			name:  "single_entry_preserved_order",
-			input: []string{"4.4.4.4"},
-			check: func(t *testing.T, got []string) {
-				if got[0] != "4.4.4.4:53" {
-					t.Errorf("expected 4.4.4.4:53, got %s", got[0])
-				}
-			},
-		},
+	conf := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(conf, []byte("nameserver 127.0.0.11\noptions ndots:0\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			// Make a copy so ResolveUpstream's in-place mutation doesn't
-			// affect other test cases sharing the slice backing array.
-			input := make([]string, len(tc.input))
-			copy(input, tc.input)
-			got := ResolveUpstream(input)
-			if tc.check != nil {
-				tc.check(t, got)
+	got, err := resolveUpstream([]string{autoUpstream}, conf)
+	if err != nil || !reflect.DeepEqual(got, []string{"127.0.0.11:53"}) {
+		t.Errorf("auto: got %v, %v", got, err)
+	}
+
+	got, err = resolveUpstream([]string{"1.1.1.1", "8.8.8.8:5353", "::1"}, conf)
+	if want := []string{"1.1.1.1:53", "8.8.8.8:5353", "[::1]:53"}; err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("servers: got %v, %v; want %v", got, err, want)
+	}
+
+	empty := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(empty, []byte("options ndots:0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveUpstream([]string{autoUpstream}, empty); err == nil {
+		t.Error("auto without nameserver: expected error (no public fallback)")
+	}
+}
+
+// TestServeDNS_Forward runs a listener with an upstream: its domain is
+// answered locally, other names are forwarded over UDP and TCP.
+func TestServeDNS_Forward(t *testing.T) {
+	t.Parallel()
+
+	upstream := startUpstream(t)
+
+	reg := NewRegistry()
+	reg.Set("web.lh", "172.17.0.2")
+
+	addr := freeAddr(t)
+	go serveDNS(DNSListener{Addr: addr, Upstream: []string{upstream}}, []string{"lh"}, makeDomainHandler(reg, false))
+
+	for _, n := range []string{"udp", "tcp"} {
+		c := &dns.Client{Net: n, Timeout: time.Second}
+		for name, want := range map[string]string{"web.lh.": "172.17.0.2", "example.com.": "192.0.2.7"} {
+			var resp *dns.Msg
+			var err error
+			for range 50 { // wait for the listener
+				m := new(dns.Msg)
+				m.SetQuestion(name, dns.TypeA)
+				if resp, _, err = c.Exchange(m, addr); err == nil {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
-		})
-	}
-}
-
-// TestResolveUpstream_ReturnedSliceHasPorts ensures every element in the
-// returned slice contains a colon (i.e. a port was appended or was already present)
-// for both custom and fallback paths.
-func TestResolveUpstream_ReturnedSliceHasPorts(t *testing.T) {
-	t.Parallel()
-	for _, input := range [][]string{
-		{"8.8.8.8"},
-		{"1.1.1.1", "9.9.9.9"},
-		{},
-		nil,
-	} {
-		input := input
-		t.Run("", func(t *testing.T) {
-			t.Parallel()
-			cp := make([]string, len(input))
-			copy(cp, input)
-			got := ResolveUpstream(cp)
-			for _, s := range got {
-				if !strings.Contains(s, ":") {
-					t.Errorf("server %q has no port", s)
-				}
+			if err != nil || len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != want {
+				t.Errorf("%s %s: got %v, %v; want %s", n, name, resp, err, want)
 			}
-		})
+		}
 	}
 }
 
-// TestResolveUpstream_EmptyFallbackNonEmpty verifies that when both the caller
-// list and /etc/resolv.conf are unavailable, the result is non-empty and all
-// entries have ports.
-func TestResolveUpstream_EmptyFallbackNonEmpty(t *testing.T) {
+// TestServeDNS_NoUpstream: without an upstream, other names get no answer.
+func TestServeDNS_NoUpstream(t *testing.T) {
 	t.Parallel()
-	got := ResolveUpstream(nil)
-	if len(got) == 0 {
-		t.Fatal("fallback must not be empty")
+
+	addr := freeAddr(t)
+	go serveDNS(DNSListener{Addr: addr}, []string{"lh"}, makeDomainHandler(NewRegistry(), false))
+
+	c := &dns.Client{Timeout: time.Second}
+	var resp *dns.Msg
+	var err error
+	for range 50 {
+		m := new(dns.Msg)
+		m.SetQuestion("example.com.", dns.TypeA)
+		if resp, _, err = c.Exchange(m, addr); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || len(resp.Answer) != 0 || resp.Rcode == dns.RcodeSuccess {
+		t.Errorf("got %v, %v; want an error rcode", resp, err)
 	}
 }
 
-// TestResolveUpstream_PublicDNSInResolvConfNoExtraFallback verifies that when
-// resolv.conf already has non-loopback (public) servers, Google DNS is NOT
-// appended — this prevents timeouts in networks that block outbound port 53.
-func TestResolveUpstream_PublicDNSInResolvConfNoExtraFallback(t *testing.T) {
+func TestForwardHandler_AllFail(t *testing.T) {
 	t.Parallel()
-	// Provide a public server directly; ResolveUpstream must return exactly that.
-	got := ResolveUpstream([]string{"1.1.1.1"})
-	if len(got) != 1 {
-		t.Fatalf("expected exactly 1 server (no extra fallback), got %v", got)
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", makeForwardHandler([]string{freeAddr(t)}))
+	srv, addr := startTestServer(t, mux)
+	defer srv.Shutdown() //nolint:errcheck
+
+	if resp := query(t, addr, "example.com.", dns.TypeA); resp.Rcode != dns.RcodeServerFailure {
+		t.Errorf("rcode = %s, want SERVFAIL", dns.RcodeToString[resp.Rcode])
 	}
-	if got[0] != "1.1.1.1:53" {
-		t.Errorf("expected 1.1.1.1:53, got %s", got[0])
+}
+
+// startUpstream serves a fake upstream answering 192.0.2.7 for every name,
+// over UDP and TCP, and returns its address.
+func startUpstream(t *testing.T) string {
+	t.Helper()
+
+	h := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		rr, _ := dns.NewRR(r.Question[0].Name + " 60 IN A 192.0.2.7")
+		m.Answer = append(m.Answer, rr)
+		w.WriteMsg(m)
+	})
+
+	addr := freeAddr(t)
+	for _, n := range []string{"udp", "tcp"} {
+		started := make(chan struct{})
+		server := &dns.Server{Addr: addr, Net: n, Handler: h, NotifyStartedFunc: func() { close(started) }}
+		go server.ListenAndServe()
+		<-started
+		t.Cleanup(func() { server.Shutdown() })
 	}
+
+	return addr
+}
+
+// freeAddr returns a 127.0.0.1 address with a port free for both UDP and TCP.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+
+	for range 20 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+		if pc, err := net.ListenPacket("udp", addr); err == nil {
+			pc.Close()
+			return addr
+		}
+	}
+	t.Fatal("no free port")
+	return ""
 }
 
 // ---------------------------------------------------------------------------

@@ -36,11 +36,19 @@ docker run -d \
     --verbose
 ```
 
-When running outside Docker, set upstream DNS explicitly to avoid a forwarding loop with `systemd-resolved`:
+Outside Docker:
 
 ```bash
-beacon --dns-listen 127.0.0.1:5053 --dns-upstream 8.8.8.8
+beacon --dns-listen 127.0.0.1:5053
 ```
+
+Beacon answers only its domains; other names are forwarded only with `?upstream=` on `--dns-listen`. To also serve containers started with `--dns 172.17.0.1` (the Docker bridge gateway), add a listener there that forwards everything else, without listening on the LAN:
+
+```bash
+beacon --dns-listen 127.0.0.1:5053 --dns-listen '172.17.0.1:53?upstream=8.8.8.8'
+```
+
+Do not use `upstream=auto` outside Docker: `/etc/resolv.conf` points to `systemd-resolved`, which may send queries back to Beacon.
 
 #### 2. Configure DNS (Ubuntu)
 
@@ -68,6 +76,48 @@ Restart `systemd-resolved`:
 
 ```sh
 sudo systemctl restart systemd-resolved
+```
+
+#### Next to another local DNS server
+
+`systemd-resolved` merges all files in `resolved.conf.d` into one server list and sends every routed domain to the current server of that list. If another file there routes other domains to another local server, Beacon's domains may end up there, or the other domains at Beacon. Give Beacon its own link instead, a dummy interface managed by `systemd-networkd`:
+
+```ini
+# /etc/systemd/network/10-beacon.netdev
+[NetDev]
+Name=beacon0
+Kind=dummy
+```
+
+```ini
+# /etc/systemd/network/10-beacon.network
+[Match]
+Name=beacon0
+
+[Network]
+# resolved uses a link for DNS only when it has a global-scope address;
+# 192.0.2.53 is TEST-NET-1 (documentation range, never routed).
+Address=192.0.2.53/32
+DNS=127.0.0.1:5053
+Domains=~beacon ~lh
+LinkLocalAddressing=no
+ConfigureWithoutCarrier=yes
+```
+
+Remove `beacon.conf` from `resolved.conf.d`. If you use `DNSStubListenerExtra`, keep it there on its own:
+
+```conf
+# /etc/systemd/resolved.conf.d/beacon.conf
+[Resolve]
+DNSStubListenerExtra=<docker-bridge-gateway>
+```
+
+Then:
+
+```bash
+sudo systemctl enable --now systemd-networkd   # manages only beacon0; NetworkManager keeps the rest
+sudo systemctl restart systemd-resolved
+resolvectl status beacon0                      # Current Scopes: DNS, DNS Servers: 127.0.0.1:5053
 ```
 
 ### macOS
@@ -199,13 +249,34 @@ A container on several networks has several IPs. Beacon answers with its IP on t
 Add a shared network when containers not on `bridge` (e.g. Compose services) must be reachable by another container:
 
 ```bash
-docker network create shared
+docker network create --subnet 172.30.0.0/24 shared
 docker network connect shared beacon   # then recreate Beacon with --network bridge,shared
 ```
 
 Attach those containers to `shared`; containers on `bridge` keep their `bridge` IP. A container that must reach all of these IPs needs both networks. On `shared`, other containers reach Beacon's API by name, e.g. with `--api-listen :80`: `http://beacon/api/records`.
 
 Beacon reads the IP when a container starts: after changing its networks, restart the container.
+
+### Containers
+
+Containers can use Beacon as their DNS server directly, on any OS. Give Beacon a fixed IP on the [shared network](#multiple-networks) (`--ip` needs a network created with `--subnet`) and forward other names:
+
+```bash
+docker network connect --ip 172.30.0.53 shared beacon   # instead of the plain connect above
+```
+
+```bash
+    --dns-listen ':53?upstream=auto' \
+    --network shared,bridge \
+```
+
+```bash
+docker run --network shared --dns 172.30.0.53 my-app
+```
+
+- `upstream=auto` forwards every other name to the nameservers in Beacon's `/etc/resolv.conf`; without `upstream` they get no answer. A listener with an upstream also serves TCP.
+- `shared` comes first in `--network`: these containers are on `shared` only, so Beacon must answer with IPs on `shared`. Containers only on `bridge` still get their `bridge` IP.
+- The host keeps using the same listener through `-p 127.0.0.1:5053:53/udp`; it sends only Beacon's domains, so nothing is forwarded for it.
 
 ### Records API
 
@@ -231,8 +302,7 @@ All options can be set via flags or environment variables.
 
 | Flag | Variable | Default | Description |
 |---|---|---|---|
-| `--dns-listen` | `BEACON_DNS_LISTEN` | `:5053` | DNS listen address |
-| `--dns-upstream` | `BEACON_DNS_UPSTREAM` | auto | Upstream DNS servers (comma-separated). When unset, read from `/etc/resolv.conf`; falls back to `8.8.8.8, 8.8.4.4` if unavailable. |
+| `--dns-listen` | `BEACON_DNS_LISTEN` | `:5053` | DNS listen address, `addr[?upstream=auto\|IP[:port]]`, repeatable or comma-separated. `upstream` (repeatable) forwards names outside `--dns-domain`, `auto` to the nameservers in `/etc/resolv.conf`; without it they get no answer. A listener with an upstream also serves TCP. E.g. `:53?upstream=auto` |
 | `--dns-domain` | `BEACON_DNS_DOMAIN` | `beacon` | DNS zones to intercept (comma-separated) |
 | `--network` | `BEACON_NETWORK` | `bridge` | Docker networks in order of preference (comma-separated) whose container IP is used; otherwise the first network by name |
 | `--record-labels` | `BEACON_RECORD_LABELS` | | Include container labels with this prefix in records (empty = none) |

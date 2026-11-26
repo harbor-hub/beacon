@@ -10,8 +10,7 @@ func NewCmd(name, version string) *cobra.Command {
 	beacon := New()
 
 	rootCmd := NewRootCmd(name, version, func(c *cobra.Command, args []string) error {
-		dnsAddr, _ := c.Flags().GetString("dns-listen")
-		dnsUpstream, _ := c.Flags().GetString("dns-upstream")
+		dnsListen, _ := c.Flags().GetStringArray("dns-listen")
 		dnsDomains, _ := c.Flags().GetString("dns-domain")
 		networks, _ := c.Flags().GetString("network")
 		recordLabels, _ := c.Flags().GetString("record-labels")
@@ -19,9 +18,13 @@ func NewCmd(name, version string) *cobra.Command {
 		apiToken, _ := c.Flags().GetString("api-token")
 		verbose, _ := c.Flags().GetBool("verbose")
 
+		dnsListeners, err := parseDNSListeners(dnsListen)
+		if err != nil {
+			return err
+		}
+
 		beacon.Version = version
-		beacon.DNSAddr = dnsAddr
-		beacon.DNSUpstream = ResolveUpstream(splitTrimmed(dnsUpstream))
+		beacon.DNSListeners = dnsListeners
 		beacon.DNSDomains = splitTrimmed(dnsDomains)
 		beacon.Networks = splitTrimmed(networks)
 		beacon.RecordLabels = recordLabels
@@ -33,8 +36,7 @@ func NewCmd(name, version string) *cobra.Command {
 	})
 
 	rootCmd.Flags().SortFlags = false
-	rootCmd.Flags().String("dns-listen", LookupEnv("BEACON_DNS_LISTEN", ":5053").GetString(), "DNS listen address")
-	rootCmd.Flags().String("dns-upstream", LookupEnv("BEACON_DNS_UPSTREAM", "").GetString(), "Comma-separated upstream DNS servers")
+	rootCmd.Flags().StringArray("dns-listen", []string{LookupEnv("BEACON_DNS_LISTEN", ":5053").GetString()}, "DNS listen address, addr[?upstream=auto|IP[:port]] (no upstream by default; repeatable or comma-separated)")
 	rootCmd.Flags().String("dns-domain", LookupEnv("BEACON_DNS_DOMAIN", "beacon").GetString(), "Comma-separated local domains")
 	rootCmd.Flags().String("network", LookupEnv("BEACON_NETWORK", "bridge").GetString(), "Comma-separated Docker networks, in order of preference, whose container IP is used (fallback: first network by name)")
 	rootCmd.Flags().String("record-labels", LookupEnv("BEACON_RECORD_LABELS", "").GetString(), "Include container labels with this prefix in records (empty = none)")

@@ -13,8 +13,7 @@ import (
 
 type Beacon struct {
 	Version      string
-	DNSAddr      string
-	DNSUpstream  []string
+	DNSListeners []DNSListener
 	DNSDomains   []string
 	Networks     []string
 	RecordLabels string
@@ -28,6 +27,15 @@ func New() *Beacon {
 }
 
 func (b *Beacon) Run() error {
+	if err := validateDNSListeners(b.DNSListeners); err != nil {
+		return err
+	}
+
+	dnsListen := make([]string, len(b.DNSListeners))
+	for i, l := range b.DNSListeners {
+		dnsListen[i] = l.String()
+	}
+
 	apiAddr := "(disabled)"
 	if b.APIAddr != "" {
 		apiAddr = b.APIAddr
@@ -38,10 +46,9 @@ func (b *Beacon) Run() error {
 		recordLabels = b.RecordLabels
 	}
 
-	fmt.Printf("\nBeacon %s\n\n  dns-listen:    %s\n  dns-upstream:  %s\n  dns-domain:    %s\n  network:       %s\n  record-labels: %s\n  api-listen:    %s\n\n",
+	fmt.Printf("\nBeacon %s\n\n  dns-listen:    %s\n  dns-domain:    %s\n  network:       %s\n  record-labels: %s\n  api-listen:    %s\n\n",
 		b.Version,
-		b.DNSAddr,
-		strings.Join(b.DNSUpstream, ", "),
+		strings.Join(dnsListen, ", "),
 		strings.Join(b.DNSDomains, ", "),
 		strings.Join(b.Networks, ", "),
 		recordLabels,
@@ -68,22 +75,9 @@ func (b *Beacon) Run() error {
 	loadRunning(cli, registry, b.Networks)
 	go watchEvents(cli, registry, b.Networks, since)
 
-	for _, domain := range b.DNSDomains {
-		dns.HandleFunc(domain+".", makeDomainHandler(registry, b.Verbose))
-	}
+	domainHandler := makeDomainHandler(registry, b.Verbose)
 
-	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		resp, err := forward(r, b.DNSUpstream)
-		if err != nil {
-			log.Printf("[DNS] Forward error: %v", err)
-			dns.HandleFailed(w, r)
-			return
-		}
-
-		w.WriteMsg(resp)
-	})
-
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1+len(b.DNSListeners))
 
 	if b.APIAddr != "" {
 		server := newHTTPServer(b.APIAddr, b.httpHandler(registry))
@@ -92,10 +86,11 @@ func (b *Beacon) Run() error {
 		}()
 	}
 
-	go func() {
-		server := &dns.Server{Addr: b.DNSAddr, Net: "udp"}
-		errCh <- fmt.Errorf("DNS server error: %w", server.ListenAndServe())
-	}()
+	for _, l := range b.DNSListeners {
+		go func() {
+			errCh <- serveDNS(l, b.DNSDomains, domainHandler)
+		}()
+	}
 
 	return <-errCh
 }
